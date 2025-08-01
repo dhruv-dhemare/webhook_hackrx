@@ -51,7 +51,11 @@ if INDEX_NAME not in pc.list_indexes().names():
     )
 index = pc.Index(INDEX_NAME)
 
-app = FastAPI()
+app = FastAPI(
+    title="HackRx Webhook API",
+    description="Query insurance policies using Pinecone + Gemini",
+    version="1.0.0"
+)
 
 # === Data Models ===
 class RunRequest(BaseModel):
@@ -241,7 +245,11 @@ def format_answer(ans: dict) -> str:
         f"under clauses {clauses}, with a {risk} risk level. Facts: {facts}"
     )
 
-# === API Endpoint ===
+# === API Endpoints ===
+@app.get("/")
+async def root():
+    return {"message": "🚀 HackRx Webhook is running! Use POST /api/v1/hackrx/run"}
+
 @app.post("/api/v1/hackrx/run")
 async def run_submission(req: RunRequest):
     logging.info("📩 POST request received")
