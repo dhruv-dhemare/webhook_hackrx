@@ -11,4 +11,3 @@ __pycache__/
 /check_index.py
 /create_index.py
 /delete_index.py
-/__pycache__
