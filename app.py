@@ -1,445 +1,303 @@
-# import os
-# import uuid
-# import time
-# import requests
-# import fitz  # PyMuPDF
-# from dotenv import load_dotenv
-# from fastapi import FastAPI, Request
-# from fastapi.responses import JSONResponse
-# import google.generativeai as genai
-# from pinecone import Pinecone, ServerlessSpec
-
-# # =========================
-# # Load environment variables
-# # =========================
-# load_dotenv()
-
-# PORT = int(os.getenv("PORT", 3001))
-# PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-# PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hackrx")
-# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GOGGLE_API_KEY")  # fallback
-
-# if not PINECONE_API_KEY or not GOOGLE_API_KEY:
-#     raise ValueError("❌ Missing PINECONE_API_KEY or GOOGLE_API_KEY in .env")
-
-# # =========================
-# # Initialize Clients
-# # =========================
-# pc = Pinecone(api_key=PINECONE_API_KEY)
-# if PINECONE_INDEX_NAME not in pc.list_indexes().names():
-#     pc.create_index(
-#         name=PINECONE_INDEX_NAME,
-#         dimension=768,
-#         metric="cosine",
-#         spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-#     )
-# index = pc.Index(PINECONE_INDEX_NAME)
-
-# genai.configure(api_key=GOOGLE_API_KEY)
-
-# app = FastAPI()
-
-# # =========================
-# # Utility Functions
-# # =========================
-
-# def download_pdf(pdf_url: str, out_path: str) -> str:
-#     """Download PDF from URL and save locally"""
-#     try:
-#         resp = requests.get(pdf_url, timeout=30)
-#         resp.raise_for_status()
-#         with open(out_path, "wb") as f:
-#             f.write(resp.content)
-#         return out_path
-#     except Exception as e:
-#         raise RuntimeError(f"❌ Failed to download PDF: {e}")
-
-# def extract_text_from_pdf(pdf_path: str) -> str:
-#     """Extract plain text from a PDF file"""
-#     text = ""
-#     with fitz.open(pdf_path) as doc:
-#         for page in doc:
-#             text += page.get_text()
-#     return text
-
-# def chunk_text(text: str, max_chars: int = 1000, overlap: int = 100):
-#     """Split text into overlapping chunks"""
-#     chunks, start = [], 0
-#     while start < len(text):
-#         end = start + max_chars
-#         chunks.append(text[start:end])
-#         start += max_chars - overlap
-#     return chunks
-
-# def embed_and_upsert(doc_id: str, chunks: list):
-#     """Embed chunks and upsert into Pinecone"""
-#     vectors = []
-#     for i, chunk in enumerate(chunks):
-#         emb = genai.embed_content(model="models/embedding-001", content=chunk)["embedding"]
-#         vectors.append({
-#             "id": f"{doc_id}-{i}",
-#             "values": emb,
-#             "metadata": {"text": chunk}
-#         })
-
-#     index.upsert(vectors=vectors)
-
-# def search_pinecone(query: str, top_k: int = 5):
-#     """Search Pinecone index for most relevant chunks"""
-#     query_emb = genai.embed_content(model="models/embedding-001", content=query)["embedding"]
-#     res = index.query(vector=query_emb, top_k=top_k, include_metadata=True)
-
-#     matches = res.get("matches", [])
-#     return [m["metadata"].get("text", "") for m in matches]
-
-# def ask_gemini(question: str, context: str) -> str:
-#     """Ask Gemini with retrieved context and return one-line answer"""
-#     model = genai.GenerativeModel("gemini-1.5-pro")
-#     prompt = f"""
-# You are an insurance policy assistant.
-# Use only the provided policy text to answer.
-
-# Policy Text:
-# \"\"\"
-# {context}
-# \"\"\"
-
-# Question:
-# {question}
-
-# Rules:
-# - Answer in ONE single line only.
-# - Always include exact numbers, % limits, days, rupee amounts if present.
-# - If coverage/limit is not explicitly mentioned, respond with exactly: "Not covered" or "Not specified".
-# - Do not add justification, explanation, or extra sentences.
-# """
-#     resp = model.generate_content(prompt)
-#     return resp.text.strip() if resp and resp.text else "Not specified"
-
-
-# # =========================
-# # API Routes
-# # =========================
-
-# @app.post("/api/v1/hackrx/run")
-# async def run_webhook(req: Request):
-#     start_time = time.time()
-#     try:
-#         data = await req.json()
-#         pdf_url = data.get("documents")
-#         questions = data.get("questions", [])
-
-#         if not pdf_url or not questions:
-#             return JSONResponse({"error": "Missing documents or questions"}, status_code=400)
-
-#         # Step 1: Download PDF
-#         doc_id = str(uuid.uuid4())
-#         pdf_path = f"./{doc_id}.pdf"
-#         print("📥 Downloading PDF...")
-#         download_pdf(pdf_url, pdf_path)
-#         print("✅ PDF downloaded")
-
-#         # Step 2: Extract text
-#         print("📄 Extracting text...")
-#         text = extract_text_from_pdf(pdf_path)
-
-#         # Step 3: Chunk text
-#         print("✂️ Chunking text...")
-#         chunks = chunk_text(text)
-#         print(f"✅ Created {len(chunks)} chunks")
-
-#         # Step 4: Embed + Upsert
-#         print("💾 Embedding & upserting into Pinecone...")
-#         embed_and_upsert(doc_id, chunks)
-#         print(f"✅ Upserted {len(chunks)} vectors into Pinecone")
-
-#         # Step 5: Answer questions
-#         answers = []
-#         for q in questions:
-#             contexts = search_pinecone(q, top_k=5)
-#             context_text = "\n".join(contexts)
-#             answer = ask_gemini(q, context_text)
-#             answers.append(answer)
-
-#         elapsed = round(time.time() - start_time, 2)
-#         return {
-#             "answers": answers,
-#             "time_taken_sec": elapsed,
-#             "debug_info": {"total_chunks": len(chunks), "pinecone_vectors": len(chunks)}
-#         }
-
-#     except Exception as e:
-#         return JSONResponse({"error": str(e)}, status_code=500)
-
-# @app.get("/")
-# async def root():
-#     return {"status": "✅ HackRx Webhook Running", "port": PORT}
-
-
-
 import os
-import uuid
-import time
-import hashlib
-import fitz  # PyMuPDF
+import sys
+import signal
 import asyncio
-import aiohttp
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+import logging
+import structlog
+import numpy as np
+import uuid
+import fitz  # PyMuPDF
+from datetime import datetime
+from typing import List, Dict, Any
+
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor
+
 import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
-import logging
-
-import numpy as np
-import tiktoken
+from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer, CrossEncoder
+import redis
 
-# =========================
-# Setup Logging
-# =========================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("hackrx")
-
-# =========================
-# Load environment variables
-# =========================
+# --- Load Env Config ---
 load_dotenv()
 
-PORT = int(os.getenv("PORT", 3001))
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hackrx")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+class Config:
+    PORT: int = int(os.getenv("PORT", 3001))
+    PINECONE_API_KEY: str = os.getenv("PINECONE_API_KEY")
+    PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "hackrx")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+    MONGODB_DB_NAME: str = os.getenv("MONGODB_DB_NAME", "insurance_policies")
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-if not PINECONE_API_KEY or not GEMINI_API_KEY:
-    raise ValueError("❌ Missing PINECONE_API_KEY or GEMINI_API_KEY in .env")
+    MAX_WORKERS: int = 16
+    TOP_K_RETRIEVAL: int = 15
+    RERANK_TOP_K: int = 8
+    EMBEDDING_DIMENSION: int = 768
+    GEMINI_SEMAPHORE_LIMIT: int = 10
+    CHUNK_SIZE: int = 500
+    CHUNK_OVERLAP: int = 100
 
-# =========================
-# Global Configuration
-# =========================
-MAX_WORKERS = 16
-BATCH_SIZE = 100
-CHUNK_SIZE = 300     # smaller chunks for precision
-CHUNK_OVERLAP = 100
-TOP_K_RETRIEVAL = 8
-RERANK_TOP_K = 5
-EMBEDDING_DIMENSION = 768
+    if not PINECONE_API_KEY or not GEMINI_API_KEY:
+        raise ValueError("❌ Missing PINECONE_API_KEY or GEMINI_API_KEY in .env")
 
-# =========================
-# Initialize Clients
-# =========================
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+# --- Logging ---
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.dev.ConsoleRenderer()
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True
+)
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+logger = structlog.get_logger("hackrx")
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
-if PINECONE_INDEX_NAME not in pc.list_indexes().names():
+# --- External Services ---
+executor = ThreadPoolExecutor(max_workers=Config.MAX_WORKERS)
+
+# Gemini
+genai.configure(api_key=Config.GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel(Config.GEMINI_MODEL)
+
+# Pinecone
+pc = Pinecone(api_key=Config.PINECONE_API_KEY)
+if Config.PINECONE_INDEX_NAME not in pc.list_indexes().names():
     pc.create_index(
-        name=PINECONE_INDEX_NAME,
-        dimension=EMBEDDING_DIMENSION,
+        name=Config.PINECONE_INDEX_NAME,
+        dimension=Config.EMBEDDING_DIMENSION,
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region="us-east-1"),
     )
-index = pc.Index(PINECONE_INDEX_NAME)
+index = pc.Index(Config.PINECONE_INDEX_NAME)
 
-embedding_model = SentenceTransformer('all-mpnet-base-v2')
+# MongoDB
+mongo_client = MongoClient(Config.MONGODB_URI, serverSelectionTimeoutMS=5000)
+db = mongo_client[Config.MONGODB_DB_NAME]
+documents_collection = db.documents
+clauses_collection = db.clauses
+
+# Redis (optional caching)
+redis_client = redis.from_url(Config.REDIS_URL, decode_responses=True)
+
+# Models
+embedding_model = SentenceTransformer("all-mpnet-base-v2")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-try:
-    tokenizer = tiktoken.get_encoding("cl100k_base")
-except:
-    tokenizer = None
+# --- FastAPI ---
+app = FastAPI(title="HackRx Webhook", version="3.1")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-embedding_lock = Lock()
-upsert_lock = Lock()
-
-app = FastAPI()
-
-# =========================
-# Request Model
-# =========================
+# --- Pydantic Models ---
 class QueryRequest(BaseModel):
-    documents: str
+    documents: str   # document URL
     questions: List[str]
 
-# =========================
-# Utility Functions
-# =========================
-def stable_doc_id(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()
+class IngestRequest(BaseModel):
+    url: str
+    title: str = ""
 
-async def download_pdf_async(pdf_url: str, out_path: str) -> str:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(pdf_url, timeout=aiohttp.ClientTimeout(total=60)) as response:
-            response.raise_for_status()
-            content = await response.read()
-            with open(out_path, "wb") as f:
-                f.write(content)
-    return out_path
-
-def extract_text_with_structure(pdf_path: str) -> str:
-    full_text = []
-    with fitz.open(pdf_path) as doc:
-        for page in doc:
-            text = page.get_text("text")
-            if text.strip():
-                full_text.append(text.strip())
-    return "\n\n".join(full_text)
-
-def simple_chunk_text(text: str, max_chars: int = 1200, overlap: int = 300) -> List[Dict]:
-    words = text.split()
-    chunks, chunk, length, chunk_id = [], [], 0, 0
-    for word in words:
-        chunk.append(word)
-        length += len(word) + 1
-        if length >= max_chars:
-            chunks.append({
-                'text': " ".join(chunk),
-                'chunk_id': chunk_id
-            })
-            chunk_id += 1
-            chunk = chunk[-(overlap//5):]  # approx overlap
-            length = sum(len(w)+1 for w in chunk)
-    if chunk:
-        chunks.append({'text': " ".join(chunk), 'chunk_id': chunk_id})
+# --- Ingestion ---
+def split_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
     return chunks
 
-def embed_chunks(chunks: List[Dict], doc_id: str) -> List[Dict]:
-    texts = [c['text'] for c in chunks]
-    with embedding_lock:
-        embeddings = embedding_model.encode(texts, convert_to_numpy=True)
-    return [{
-        "id": f"{doc_id}-{i}",
-        "values": emb.tolist(),
-        "metadata": {"text": c['text'], "doc_id": doc_id}
-    } for i, (c, emb) in enumerate(zip(chunks, embeddings))]
+@app.post("/api/v1/hackrx/ingest")
+async def ingest_document(body: IngestRequest):
+    doc_id = str(uuid.uuid4())
+    logger.info("📥 Ingesting document", url=body.url, doc_id=doc_id)
 
-def upsert_vectors(vectors: List[Dict], doc_id: str):
-    with upsert_lock:
-        for i in range(0, len(vectors), BATCH_SIZE):
-            index.upsert(vectors=vectors[i:i+BATCH_SIZE], namespace=doc_id)
+    # Extract text from PDF
+    doc = fitz.open(body.url)
+    text = ""
+    for page in doc:
+        text += page.get_text("text")
 
-def parallel_embed_and_upsert(doc_id: str, chunks: List[Dict]):
-    chunk_batches = [chunks[i:i+50] for i in range(0, len(chunks), 50)]
-    all_vectors = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(embed_chunks, batch, doc_id) for batch in chunk_batches]
-        for f in as_completed(futures):
-            all_vectors.extend(f.result())
-    upsert_vectors(all_vectors, doc_id)
+    # Split into clauses
+    chunks = split_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
 
-def enhanced_search(query: str, doc_id: str) -> List[Dict]:
-    q_emb = embedding_model.encode([query])[0].tolist()
-    res = index.query(vector=q_emb, top_k=TOP_K_RETRIEVAL, include_metadata=True, namespace=doc_id)
-    matches = res.get("matches", [])
-    results = [{"text": m["metadata"]["text"], "score": m["score"]} for m in matches]
+    # Insert document
+    documents_collection.insert_one({
+        "doc_id": doc_id,
+        "url": body.url,
+        "title": body.title,
+        "created_at": datetime.utcnow(),
+        "processed": True
+    })
 
-    # Rerank with CrossEncoder
-    pairs = [(query, r["text"]) for r in results]
-    scores = reranker.predict(pairs)
-    for i, sc in enumerate(scores):
-        results[i]["rerank_score"] = float(sc)
-    results.sort(key=lambda x: x["rerank_score"], reverse=True)
-    return results[:RERANK_TOP_K]
+    # Insert clauses into Mongo + Pinecone
+    vectors = []
+    for i, chunk in enumerate(chunks):
+        clause_id = str(uuid.uuid4())
+        embedding = embedding_model.encode([chunk], convert_to_numpy=True)[0]
 
-def build_context(results: List[Dict]) -> str:
-    return "\n\n".join([f"Context {i+1}: {r['text']}" for i, r in enumerate(results)])
+        clause_doc = {
+            "clause_id": clause_id,
+            "doc_id": doc_id,
+            "original_text": chunk,
+            "dense_text": chunk,
+            "section": f"Section-{i+1}",
+            "clause_type": "general",
+            "keywords": [],  # optional: pre-extracted keywords
+            "created_at": datetime.utcnow()
+        }
+        clauses_collection.insert_one(clause_doc)
 
+        vectors.append({
+            "id": clause_id,
+            "values": embedding.tolist(),
+            "metadata": {"doc_id": doc_id}
+        })
+
+    index.upsert(vectors=vectors, namespace=doc_id)
+    return {"status": "success", "doc_id": doc_id, "clauses": len(chunks)}
+
+# --- Search ---
+def multi_strategy_search(query: str, doc_id: str) -> List[Dict]:
+    q_emb = embedding_model.encode([query], convert_to_numpy=True)[0].tolist()
+    vector_results = index.query(
+        vector=q_emb,
+        top_k=Config.TOP_K_RETRIEVAL,
+        include_metadata=True,
+        namespace=doc_id
+    )
+
+    clause_ids = [m["id"] for m in vector_results.get("matches", [])]
+    if not clause_ids:
+        return []
+
+    full_clauses = list(clauses_collection.find({"clause_id": {"$in": clause_ids}}))
+    clause_map = {c["clause_id"]: c for c in full_clauses}
+
+    enriched_results = []
+    for match in vector_results.get("matches", []):
+        cid = match["id"]
+        if cid in clause_map:
+            c = clause_map[cid]
+            enriched_results.append({**c, "vector_score": match["score"]})
+
+    if len(enriched_results) > 1:
+        pairs = [(query, r["original_text"]) for r in enriched_results]
+        rerank_scores = reranker.predict(pairs)
+
+        vec_scores = np.array([r["vector_score"] for r in enriched_results])
+        rer_scores = np.array(rerank_scores)
+
+        # Normalize
+        vec_scores = (vec_scores - vec_scores.min()) / (np.ptp(vec_scores) + 1e-8)
+        rer_scores = (rer_scores - rer_scores.min()) / (np.ptp(rer_scores) + 1e-8)
+
+        alpha = 0.5 if len(enriched_results) > 5 else 0.4
+        for r, vs, rs in zip(enriched_results, vec_scores, rer_scores):
+            r["final_score"] = vs * (1 - alpha) + rs * alpha
+
+        enriched_results.sort(key=lambda x: x["final_score"], reverse=True)
+
+    return enriched_results[:Config.RERANK_TOP_K]
+
+# --- Context Builder ---
+def build_context(results: List[Dict], query: str) -> str:
+    if not results:
+        return "No relevant clauses found."
+    context_parts = [f"QUESTION: {query}\n"]
+    for i, clause in enumerate(results, 1):
+        context_parts.append(
+            f"Clause {i} ({clause['section']}): {clause['dense_text']}"
+        )
+    return "\n".join(context_parts)
+
+# --- QA Wrapper ---
 def ask_gemini(question: str, context: str) -> str:
     prompt = f"""
-You are an insurance policy assistant. Answer based on contexts.
+You are an expert insurance policy analyst. Answer based only on the provided clauses.
+If info is missing, say so explicitly.
 
-CONTEXTS:
+CLAUSES:
 {context}
 
 QUESTION: {question}
-
-Rules:
-- If exact numbers/limits appear, include them.
-- If not in contexts, say "Not specified in policy".
-- If excluded, say "Not covered".
-- Be precise, one sentence.
 """
     try:
-        resp = gemini_model.generate_content(prompt)
-        return resp.text.strip()
+        response = gemini_model.generate_content(prompt)
+        return response.text.strip()
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return "Error"
+        logger.error("Gemini QA error", error=str(e))
+        return f"Error: {str(e)}"
 
-async def ask_gemini_async(q: str, context: str) -> str:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, ask_gemini, q, context)
+async def ask_gemini_async(question: str, context: str) -> str:
+    return await asyncio.get_event_loop().run_in_executor(executor, ask_gemini, question, context)
 
-# =========================
-# API Routes
-# =========================
+# --- Query Route ---
 @app.post("/api/v1/hackrx/run")
 async def run_webhook(body: QueryRequest):
-    start = time.time()
-    try:
-        pdf_url, questions = body.documents, body.questions
-        if not pdf_url or not questions:
-            return JSONResponse({"error": "Missing documents or questions"}, status_code=400)
+    doc = documents_collection.find_one({"url": body.documents})
+    if not doc:
+        raise HTTPException(404, "Document not found. Please ingest first.")
+    doc_id = doc["doc_id"]
 
-        doc_id = stable_doc_id(pdf_url)
-        stats = index.describe_index_stats()
-        namespaces = stats.get("namespaces", {})
+    answers = []
+    for q in body.questions:
+        results = multi_strategy_search(q, doc_id)
+        context = build_context(results, q)
+        answer = await ask_gemini_async(q, context)
 
-        if doc_id not in namespaces or namespaces[doc_id].get("vector_count", 0) == 0:
-            logger.info("📥 Indexing new PDF...")
-            pdf_path = f"./{doc_id}.pdf"
-            await download_pdf_async(pdf_url, pdf_path)
-            text = extract_text_with_structure(pdf_path)
-            chunks = simple_chunk_text(text, max_chars=CHUNK_SIZE*4, overlap=CHUNK_OVERLAP*4)
-            logger.info(f"Created {len(chunks)} chunks")
-            await asyncio.get_event_loop().run_in_executor(None, parallel_embed_and_upsert, doc_id, chunks)
-            os.remove(pdf_path)
-        else:
-            logger.info("⚡ Using cached embeddings")
+        answers.append(answer)
 
-        tasks = []
-        for q in questions:
-            results = enhanced_search(q, doc_id)
-            ctx = build_context(results)
-            tasks.append(ask_gemini_async(q, ctx))
+    # ✅ Return in required format
+    return {"answers": answers}
 
-        answers = await asyncio.gather(*tasks)
-        elapsed = round(time.time() - start, 2)
-
-        return {
-            "answers": answers,
-            "time_taken_sec": elapsed,
-            "doc_id": doc_id,
-            "chunks_processed": namespaces.get(doc_id, {}).get("vector_count", 0),
-            "questions_processed": len(questions),
-            "avg_time_per_question": round(elapsed/len(questions), 2)
-        }
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.get("/")
-async def root():
-    return {"status": "✅ HackRx Webhook (Optimized)", "embedding_model": "all-mpnet-base-v2", "reranker": "CrossEncoder-MSMarco", "llm_model": "gemini-1.5-flash"}
 
 @app.get("/health")
 async def health_check():
     try:
-        stats = index.describe_index_stats()
-        test_resp = gemini_model.generate_content("ping")
-        return {
-            "status": "healthy",
-            "pinecone_connected": True,
-            "gemini_connected": bool(test_resp.text),
-            "total_vectors": stats.get("total_vector_count", 0),
-        }
+        gemini_test = await asyncio.to_thread(
+            gemini_model.generate_content, "What is insurance?"
+        )
+        return {"status": "healthy", "gemini": bool(gemini_test and gemini_test.text)}
     except Exception as e:
-        return JSONResponse({"status": "unhealthy", "error": str(e)}, status_code=503)
+        return {"status": "unhealthy", "error": str(e)}
+
+@app.get("/")
+async def root():
+    return {"status": "✅ HackRx Webhook v3.1 (DB + Pinecone separation)"}
+
+# --- Shutdown ---
+def handle_shutdown(sig, frame):
+    logger.info("🛑 Shutdown", signal=sig)
+    try:
+        mongo_client.close()
+        redis_client.close()
+        executor.shutdown(wait=True)
+    finally:
+        sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    logger.info("🚀 Starting HackRx Webhook v3.1", port=Config.PORT)
+    uvicorn.run(app, host="0.0.0.0", port=Config.PORT)
