@@ -7,6 +7,7 @@ import structlog
 import numpy as np
 import uuid
 import fitz  # PyMuPDF
+import requests
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -97,7 +98,7 @@ embedding_model = SentenceTransformer("all-mpnet-base-v2")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # --- FastAPI ---
-app = FastAPI(title="HackRx Webhook", version="3.1")
+app = FastAPI(title="HackRx Webhook", version="3.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -112,11 +113,7 @@ class QueryRequest(BaseModel):
     documents: str   # document URL
     questions: List[str]
 
-class IngestRequest(BaseModel):
-    url: str
-    title: str = ""
-
-# --- Ingestion ---
+# --- Helpers ---
 def split_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
     chunks, start = [], 0
     while start < len(text):
@@ -125,57 +122,6 @@ def split_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str
         start += chunk_size - overlap
     return chunks
 
-@app.post("/api/v1/hackrx/ingest")
-async def ingest_document(body: IngestRequest):
-    doc_id = str(uuid.uuid4())
-    logger.info("📥 Ingesting document", url=body.url, doc_id=doc_id)
-
-    # Extract text from PDF
-    doc = fitz.open(body.url)
-    text = ""
-    for page in doc:
-        text += page.get_text("text")
-
-    # Split into clauses
-    chunks = split_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
-
-    # Insert document
-    documents_collection.insert_one({
-        "doc_id": doc_id,
-        "url": body.url,
-        "title": body.title,
-        "created_at": datetime.utcnow(),
-        "processed": True
-    })
-
-    # Insert clauses into Mongo + Pinecone
-    vectors = []
-    for i, chunk in enumerate(chunks):
-        clause_id = str(uuid.uuid4())
-        embedding = embedding_model.encode([chunk], convert_to_numpy=True)[0]
-
-        clause_doc = {
-            "clause_id": clause_id,
-            "doc_id": doc_id,
-            "original_text": chunk,
-            "dense_text": chunk,
-            "section": f"Section-{i+1}",
-            "clause_type": "general",
-            "keywords": [],  # optional: pre-extracted keywords
-            "created_at": datetime.utcnow()
-        }
-        clauses_collection.insert_one(clause_doc)
-
-        vectors.append({
-            "id": clause_id,
-            "values": embedding.tolist(),
-            "metadata": {"doc_id": doc_id}
-        })
-
-    index.upsert(vectors=vectors, namespace=doc_id)
-    return {"status": "success", "doc_id": doc_id, "clauses": len(chunks)}
-
-# --- Search ---
 def multi_strategy_search(query: str, doc_id: str) -> List[Dict]:
     q_emb = embedding_model.encode([query], convert_to_numpy=True)[0].tolist()
     vector_results = index.query(
@@ -218,7 +164,6 @@ def multi_strategy_search(query: str, doc_id: str) -> List[Dict]:
 
     return enriched_results[:Config.RERANK_TOP_K]
 
-# --- Context Builder ---
 def build_context(results: List[Dict], query: str) -> str:
     if not results:
         return "No relevant clauses found."
@@ -229,7 +174,6 @@ def build_context(results: List[Dict], query: str) -> str:
         )
     return "\n".join(context_parts)
 
-# --- QA Wrapper ---
 def ask_gemini(question: str, context: str) -> str:
     prompt = f"""
 You are an expert insurance policy analyst. Answer based only on the provided clauses.
@@ -250,26 +194,82 @@ QUESTION: {question}
 async def ask_gemini_async(question: str, context: str) -> str:
     return await asyncio.get_event_loop().run_in_executor(executor, ask_gemini, question, context)
 
-# --- Query Route ---
+# --- Unified QA Endpoint ---
 @app.post("/api/v1/hackrx/run")
-async def run_webhook(body: QueryRequest):
+async def qa_webhook(body: QueryRequest):
+    # 1. Check if doc exists
     doc = documents_collection.find_one({"url": body.documents})
-    if not doc:
-        raise HTTPException(404, "Document not found. Please ingest first.")
-    doc_id = doc["doc_id"]
+    if doc:
+        doc_id = doc["doc_id"]
+    else:
+        # --- Ingestion ---
+        doc_id = str(uuid.uuid4())
+        logger.info("📥 Ingesting document", url=body.documents, doc_id=doc_id)
 
+        # Download PDF
+        resp = requests.get(body.documents)
+        resp.raise_for_status()
+        pdf_bytes = resp.content
+
+        # Extract text
+        pdf_doc = fitz.open("pdf", pdf_bytes)
+        text = ""
+        for page in pdf_doc:
+            text += page.get_text("text")
+
+        # Split
+        chunks = split_text(text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP)
+
+        # Insert document metadata
+        documents_collection.insert_one({
+            "doc_id": doc_id,
+            "url": body.documents,
+            "title": body.documents.split("/")[-1],
+            "created_at": datetime.utcnow(),
+            "processed": True
+        })
+
+        # Insert clauses into Mongo + Pinecone
+        vectors = []
+        for i, chunk in enumerate(chunks):
+            clause_id = str(uuid.uuid4())
+            embedding = embedding_model.encode([chunk], convert_to_numpy=True)[0]
+
+            clause_doc = {
+                "clause_id": clause_id,
+                "doc_id": doc_id,
+                "original_text": chunk,
+                "dense_text": chunk,
+                "section": f"Section-{i+1}",
+                "clause_type": "general",
+                "keywords": [],
+                "created_at": datetime.utcnow()
+            }
+            clauses_collection.insert_one(clause_doc)
+
+            vectors.append({
+                "id": clause_id,
+                "values": embedding.tolist(),
+                "metadata": {"doc_id": doc_id}
+            })
+
+        index.upsert(vectors=vectors, namespace=doc_id)
+        logger.info("✅ Ingestion complete", clauses=len(chunks), doc_id=doc_id)
+
+    # 2. Answer questions
     answers = []
     for q in body.questions:
         results = multi_strategy_search(q, doc_id)
         context = build_context(results, q)
         answer = await ask_gemini_async(q, context)
-
         answers.append(answer)
 
-    # ✅ Return in required format
-    return {"answers": answers}
+    return {
+        "doc_id": doc_id,
+        "answers": answers
+    }
 
-
+# --- Health + Root ---
 @app.get("/health")
 async def health_check():
     try:
@@ -282,7 +282,7 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    return {"status": "✅ HackRx Webhook v3.1 (DB + Pinecone separation)"}
+    return {"status": "✅ HackRx Webhook v3.2 (Single QA endpoint)"}
 
 # --- Shutdown ---
 def handle_shutdown(sig, frame):
@@ -299,5 +299,5 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting HackRx Webhook v3.1", port=Config.PORT)
+    logger.info("🚀 Starting HackRx Webhook v3.2", port=Config.PORT)
     uvicorn.run(app, host="0.0.0.0", port=Config.PORT)

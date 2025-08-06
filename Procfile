@@ -1,1 +1,0 @@
-﻿web:python3-muvicornapp:app--host0.0.0.0--port
