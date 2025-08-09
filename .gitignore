@@ -6,8 +6,3 @@ __pycache__/
 *.pdf
 .vercel
 /node_modules
-/old.txt
-/redis_check.py
-/check_index.py
-/create_index.py
-/delete_index.py
